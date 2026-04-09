@@ -147,10 +147,10 @@ def grouped_gemm_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Python wrapper
+# Python wrappers
 # ---------------------------------------------------------------------------
 
-def run_grouped_gemm(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, num_xcds):
+def run_grouped_gemm_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, num_xcds):
     num_n_tiles = triton.cdiv(N, 128)
     num_m_tiles_per_group = (group_sizes + 128 - 1) // 128
     total_tiles = int((num_m_tiles_per_group * num_n_tiles).sum().item())
@@ -162,6 +162,15 @@ def run_grouped_gemm(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, num_xcds)
         GROUP_SIZE=1, GRID_DIM=grid_dim, NUM_XCDS=num_xcds,
     )
     return out
+
+
+def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_xcds):
+    from primus_turbo.pytorch.ops import grouped_gemm as pt_grouped_gemm
+    return pt_grouped_gemm(lhs, rhs, group_lens, num_cu=num_cu)
+
+
+# Default — overridden by main() based on --backend
+run_grouped_gemm = run_grouped_gemm_triton
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +387,9 @@ def main():
                         help="Enable PyTorch profiler trace export")
     parser.add_argument("--num-ag", type=int, default=1,
                         help="Number of concurrent all-gathers to launch during overlap")
+    parser.add_argument("--backend", type=str, default="triton",
+                        choices=["triton", "primus"],
+                        help="Grouped GEMM backend: 'triton' (built-in) or 'primus' (Primus-Turbo CK)")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -385,15 +397,22 @@ def main():
 
     G, M, K, N = args.G, args.M, args.K, args.N
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
+    backend = args.backend
 
-    # Ensure K is divisible by BLOCK_K=64
-    assert K % 64 == 0, f"K={K} must be divisible by 64"
+    global run_grouped_gemm
+    if backend == "triton":
+        # Ensure K is divisible by BLOCK_K=64
+        assert K % 64 == 0, f"K={K} must be divisible by 64"
+        run_grouped_gemm = run_grouped_gemm_triton
+    else:
+        run_grouped_gemm = run_grouped_gemm_primus
 
     nccl_max_nchannels = os.environ.get("NCCL_MAX_NCHANNELS", "")
 
     if rank == 0:
         print(f"Config: G={G}, M={M}, K={K}, N={N}, world_size={world_size}",
               file=sys.stderr)
+        print(f"Backend: {backend}", file=sys.stderr)
         print(f"Grid dims to sweep: {grid_dims}", file=sys.stderr)
         print(f"NCCL_MAX_NCHANNELS={nccl_max_nchannels or 'default'}", file=sys.stderr)
         print(f"All-gather size: {args.ag_size_mb} MB", file=sys.stderr)
@@ -408,7 +427,8 @@ def main():
     gs_list = [group_size_val] * G
     if remainder > 0:
         gs_list[-1] += remainder
-    group_sizes = torch.tensor(gs_list, dtype=torch.int32, device=device)
+    gs_dtype = torch.int64 if backend == "primus" else torch.int32
+    group_sizes = torch.tensor(gs_list, dtype=gs_dtype, device=device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
 
     ag_numel = args.ag_size_mb * 1024 * 1024 // 2  # bf16 = 2 bytes
