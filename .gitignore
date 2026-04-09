@@ -1,0 +1,5 @@
+traces/
+*.swp
+__pycache__/
+*.pyc
+results.csv
