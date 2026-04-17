@@ -166,7 +166,7 @@ def run_grouped_gemm_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, nu
 
 def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_xcds):
     from primus_turbo.pytorch.ops import grouped_gemm as pt_grouped_gemm
-    return pt_grouped_gemm(lhs, rhs, group_lens, num_cu=num_cu)
+    return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu)
 
 
 # Default — overridden by main() based on --backend
@@ -390,6 +390,8 @@ def main():
     parser.add_argument("--backend", type=str, default="triton",
                         choices=["triton", "primus"],
                         help="Grouped GEMM backend: 'triton' (built-in) or 'primus' (Primus-Turbo CK)")
+    parser.add_argument("--trans-b", action="store_true",
+                        help="Use transposed weight layout [G, N, K] (Primus backend only)")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -399,10 +401,12 @@ def main():
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
     backend = args.backend
 
-    global run_grouped_gemm
+    global run_grouped_gemm, _primus_trans_b
+    _primus_trans_b = args.trans_b
     if backend == "triton":
         # Ensure K is divisible by BLOCK_K=64
         assert K % 64 == 0, f"K={K} must be divisible by 64"
+        assert not args.trans_b, "--trans-b is only supported with --backend primus"
         run_grouped_gemm = run_grouped_gemm_triton
     else:
         run_grouped_gemm = run_grouped_gemm_primus
@@ -421,7 +425,10 @@ def main():
 
     # Allocate tensors
     lhs = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    rhs = torch.randn(G, K, N, dtype=torch.bfloat16, device=device)
+    if args.trans_b:
+        rhs = torch.randn(G, N, K, dtype=torch.bfloat16, device=device)
+    else:
+        rhs = torch.randn(G, K, N, dtype=torch.bfloat16, device=device)
     group_size_val = M // G
     remainder = M % G
     gs_list = [group_size_val] * G
