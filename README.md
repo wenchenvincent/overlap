@@ -34,6 +34,9 @@ NCCL_MAX_NCHANNELS=16 NUM_CU=240 TEST_OVERLAP_TRACE_DIR=./traces python3 test_ov
 | `bench_collectives.py` | Compares CU resource usage across all-gather, reduce-scatter, and all-reduce. |
 | `run.sh` | Orchestrates `NCCL_MAX_NCHANNELS` sweep across multiple `torchrun` invocations. |
 | `check_transb_resources.py` | Utility to compare CU resources between `trans_b=False` and `trans_b=True` kernel paths. |
+| `att_overlap.json` | `rocprofv3` ATT config: kernel-filter to `GroupedGemm`, full 32-SE coverage, 4 consecutive captures. See [ATT tracing](#per-block-dispatch-tracing-with-att). |
+| `run_att.sh` | Rank-0-only wrapper for `rocprofv3 --att`. Other ranks run plain `python`. Used with `torchrun --no-python`. |
+| `quick_analysis.py` | Reads `occupancy.json` from an ATT trace and prints: distinct CUs used, oversubscribed CUs (the dispatcher-bug indicator), late-dispatching blocks. |
 
 ## Key Findings
 
@@ -154,3 +157,151 @@ rocprofv3 --sys-trace --rccl-trace -f pftrace -d ./traces -- \
 NCCL_DEBUG=INFO torchrun --nproc_per_node=8 bench_overlap.py ...
 # Shows channel count, algorithm, protocol per collective
 ```
+
+## Per-block dispatch tracing with ATT
+
+Traditional `rocprofv3 --sys-trace` and PMC counters give per-kernel timing and
+aggregate counter values, but they cannot tell you **which specific CU each
+GEMM block ran on** or **when each block started executing**. That information
+is what's needed to see the dispatcher-placement bug behind the overlap
+slowdown — where on certain ROCm builds 1–2 GEMM blocks land on a CU that
+already has a block, while 30 other CUs sit idle, doubling the kernel wallclock.
+
+ROCm's **Architecture Thread Trace (ATT)** is the only standard tool that
+records per-wave start/end events at cycle granularity, per (SE, CU, SIMD).
+The three files in this repo wrap rocprofv3's ATT for this specific
+investigation.
+
+### Prerequisites
+
+ATT requires the closed-source decoder library. On Ubuntu 22.04:
+
+```bash
+cd /tmp
+URL=$(curl -s https://api.github.com/repos/ROCm/rocprof-trace-decoder/releases/tags/0.1.6 \
+  | python3 -c 'import sys,json; data=json.load(sys.stdin); [print(a["browser_download_url"]) for a in data.get("assets",[]) if "ubuntu-22.04" in a["name"] and a["name"].endswith(".deb")]')
+curl -sL -o decoder.deb "$URL"
+sudo dpkg -i decoder.deb
+ls /opt/rocm/lib/librocprof-trace-decoder.so   # verify
+```
+
+### How `att_overlap.json` is configured
+
+```json
+{
+    "jobs": [{
+        "kernel_include_regex": "GroupedGemm",
+        "advanced_thread_trace": true,
+        "att_target_cu": 0,
+        "att_shader_engine_mask": "0xFFFFFFFF",
+        "att_simd_select": "0xF",
+        "att_buffer_size": "0x60000000",
+        "att_consecutive_kernels": 4
+    }]
+}
+```
+
+| Knob | Meaning |
+|---|---|
+| `kernel_include_regex: GroupedGemm` | Only trace the CK grouped-GEMM kernel. RCCL waves running on the same CUs are still captured (they show up as 100M+-cycle "long" waves). |
+| `att_shader_engine_mask: 0xFFFFFFFF` | All 32 SEs (4 SEs × 8 XCDs) — full GPU coverage. Each hex digit is one XCD, each bit is one SE within that XCD. |
+| `att_target_cu: 0` | Capture starting from CU 0; despite the name this still records all CUs of the enabled SEs (each with up to ~8 CUs). |
+| `att_simd_select: 0xF` | All 4 SIMDs per CU. |
+| `att_buffer_size: 0x60000000` | 1.5 GB ATT buffer per SE. Sized to capture multiple consecutive GEMM kernels. |
+| `att_consecutive_kernels: 4` | Capture 4 successive GroupedGemm dispatches. The slowdown is bimodal per iter (~2 fast + ~3 slow per 5 iters), so capturing several lets you compare. |
+
+### How `run_att.sh` is structured
+
+`torchrun` spawns 8 worker processes; we only want one of them traced (rank 0).
+The wrapper checks `LOCAL_RANK` and either runs `rocprofv3 --att` or plain
+`python`. By default it reads `att_overlap.json` from the script's own
+directory; you can override with the `ATT_CONFIG` env var.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ATT_CONFIG` | `$(dirname run_att.sh)/att_overlap.json` | Path to the rocprofv3 ATT JSON config. |
+| `TRACE_DIR` | `/tmp/att_out` | Where to write trace output. |
+| `TRACE_TAG` | `trace` | File-name prefix for output. |
+
+### Running an ATT capture
+
+```bash
+rm -rf /tmp/att_out
+
+TRACE_DIR=/tmp/att_out TRACE_TAG=run1 NCCL_MAX_NCHANNELS=16 \
+torchrun --nproc_per_node=8 --no-python ./run_att.sh \
+  bench_overlap_only.py --grid-dims 228 --seconds 12 --warmup 5
+```
+
+The `--no-python` flag tells `torchrun` to launch the wrapper script directly
+instead of calling `python <script>`. Expect `Wave incomplete: trace was cutoff`
+warnings — the buffer fills and capture stops at a kernel boundary; that's
+fine.
+
+To use a different config, point `ATT_CONFIG` at it:
+```bash
+ATT_CONFIG=/path/to/custom.json TRACE_DIR=/tmp/att_out TRACE_TAG=run1 NCCL_MAX_NCHANNELS=16 \
+torchrun --nproc_per_node=8 --no-python ./run_att.sh bench_overlap_only.py ...
+```
+
+### Output layout
+
+```
+/tmp/att_out/
+├── ui_output_agent_<PID>_dispatch_<DID>/
+│   ├── occupancy.json        ← per-(SE, CU, SIMD) wave start/end events; primary input to quick_analysis.py
+│   ├── filenames.json        ← wave-file index by (SE, SIMD, slot, wave)
+│   ├── realtime.json         ← SE-level kernel start/end timestamps
+│   ├── code.json             ← disassembled GEMM kernel
+│   ├── se*_sm*_sl0_wv*.json  ← individual wave traces (instructions executed)
+│   └── wstates*.json         ← wave-state samples
+├── run1_<PID>_shader_engine_<N>_<DID>.att   ← raw ATT binaries (need rocprof-trace-decoder; viewable in rocprof-compute-viewer)
+├── run1_<PID>_code_object_id_*.out          ← kernel binaries (ELF)
+├── run1_<PID>_results.db                    ← SQLite: kernel dispatches + RCCL events
+└── stats_ui_output_*.csv                    ← per-instruction Hitcount/Latency/Stall summary
+```
+
+### Quick analysis
+
+`quick_analysis.py` answers the headline question: *did the dispatcher
+oversubscribe any CU during kernel 1?*
+
+```bash
+python3 quick_analysis.py /tmp/att_out/ui_output_agent_*_dispatch_*/occupancy.json
+```
+
+Output:
+```
+Total blocks: 228
+Distinct CUs used: 226
+Oversubscribed CUs (got 2 blocks): 2
+  XCD0 SE3 CU4: 2 blocks
+  XCD6 SE25 CU1: 2 blocks
+Late waves (start > earliest+1M): 8  (= 2 late blocks)
+```
+
+Reading this on the broken host (older amdgpu / firmware):
+
+- **228 blocks on 226 distinct CUs** → 2 CUs got 2 GEMM blocks each.
+- **Oversubscribed CUs** are non-deterministic across kernels; the colliding
+  CU varies per iter. This is the dispatcher race.
+- **Late blocks** start ~3.5M cycles after the others — they're waiting for
+  the *first* block on the colliding CU to finish before they can run. Wave
+  duration once started is normal (~3.5M cycles); the kernel can't end until
+  these last blocks finish, doubling its wallclock.
+
+On the fixed host, the same command reports:
+```
+Total blocks: 228
+Distinct CUs used: 228
+Oversubscribed CUs (got 2 blocks): 0
+Late waves (start > earliest+1M): 0
+```
+
+### Visualization in the GUI
+
+The raw `*.att` files plus `code_object_id_*.out` can be opened in
+[`rocprof-compute-viewer`](https://github.com/ROCm/rocprof-compute-viewer)
+(install on your laptop, `scp` the trace dir to it). The viewer renders a
+per-CU wave timeline; oversubscribed CUs show two bars stacked sequentially
+on the same CU row.
