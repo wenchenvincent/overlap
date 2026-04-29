@@ -34,6 +34,7 @@ NCCL_MAX_NCHANNELS=16 NUM_CU=240 TEST_OVERLAP_TRACE_DIR=./traces python3 test_ov
 | `bench_collectives.py` | Compares CU resource usage across all-gather, reduce-scatter, and all-reduce. |
 | `run.sh` | Orchestrates `NCCL_MAX_NCHANNELS` sweep across multiple `torchrun` invocations. |
 | `check_transb_resources.py` | Utility to compare CU resources between `trans_b=False` and `trans_b=True` kernel paths. |
+| `bench_overlap_only.py` | Stripped-down benchmark: only the overlap loop (no gemm-only / sequential phases). Used as the workload for the ATT trace. |
 | `att_overlap.json` | `rocprofv3` ATT config: kernel-filter to `GroupedGemm`, full 32-SE coverage, 4 consecutive captures. See [ATT tracing](#per-block-dispatch-tracing-with-att). |
 | `run_att.sh` | Rank-0-only wrapper for `rocprofv3 --att`. Other ranks run plain `python`. Used with `torchrun --no-python`. |
 | `quick_analysis.py` | Reads `occupancy.json` from an ATT trace and prints: distinct CUs used, oversubscribed CUs (the dispatcher-bug indicator), late-dispatching blocks. |
@@ -244,6 +245,73 @@ ATT_CONFIG=/path/to/custom.json TRACE_DIR=/tmp/att_out TRACE_TAG=run1 NCCL_MAX_N
 torchrun --nproc_per_node=8 --no-python ./run_att.sh bench_overlap_only.py ...
 ```
 
+### What kernels get captured (and the warmup gotcha)
+
+ATT in dispatch mode captures the **first N matching kernels**, where N =
+`att_consecutive_kernels` from the JSON config. The kernel filter
+(`kernel_include_regex: GroupedGemm`) matches **every** GroupedGemm dispatch
+including the ones during `bench_overlap_only.py`'s warmup loop. With the
+default `--warmup 5` and `att_consecutive_kernels: 4`, all 4 captured kernels
+are warmup iterations.
+
+That has one important consequence: **kernel 1 of the trace is the very first
+warmup iter, where NCCL has not yet completed its device-side setup for the
+all-gather**. RCCL's worker workgroups don't dispatch until ≈45 ms after the
+host-side `dist.all_gather_into_tensor()` call, by which point GEMM kernel 1
+has already finished. So kernel 1 of the trace shows **0 RCCL CUs** — not
+because the bench skipped overlap on iter 1, but because NCCL's first-call
+setup beats GEMM completion. Kernel 2 onward is steady-state overlap (16 RCCL
+CUs concurrent).
+
+`quick_analysis.py` defaults to **kernel 2** to skip this cold iteration. Pass
+a different index if you want to inspect a specific kernel:
+```bash
+python3 quick_analysis.py occupancy.json 1   # kernel 1 (cold; 0 RCCL)
+python3 quick_analysis.py occupancy.json 3   # kernel 3 (steady-state)
+```
+
+If you want ATT to skip warmup entirely and only capture timed-loop iters,
+two options:
+
+1. **Increase `--warmup` enough** that NCCL's first-call setup is amortized
+   *and* `att_consecutive_kernels` is exhausted before the timed loop starts.
+   Crude but no code changes:
+   ```bash
+   torchrun ... ./run_att.sh bench_overlap_only.py --warmup 4 --seconds 12
+   ```
+   With `att_consecutive_kernels: 4`, ATT captures warmup iters 1–4. The
+   timed loop starts after warmup but isn't traced — you'd lose data.
+   *Not recommended.*
+
+2. **Use roctx markers + `--selected-regions`** to gate ATT on a code region.
+   Wrap the timed loop with `roctx_profiler_pause(0)` / `roctx_profiler_resume(0)`
+   and add `--selected-regions 1` to the rocprofv3 invocation. This is the
+   correct fix; requires the `rocprofiler-sdk-roctx` Python bindings and a
+   small edit to `bench_overlap_only.py`. Suggested skeleton:
+   ```python
+   from rocprofiler_sdk_roctx import profiler_pause, profiler_resume
+   profiler_pause(0)               # pause ATT during warmup
+   for _ in range(args.warmup):
+       ... (existing warmup body)
+   dist.barrier()
+   profiler_resume(0)              # resume — ATT now captures
+   while time.time() < deadline:
+       ... (existing timed-loop body)
+   ```
+   Then run with:
+   ```bash
+   ATT_EXTRA_FLAGS="--selected-regions 1" \
+   torchrun --nproc_per_node=8 --no-python ./run_att.sh bench_overlap_only.py ...
+   ```
+   (`run_att.sh` would need a small extension to forward `ATT_EXTRA_FLAGS`
+   into the rocprofv3 command line.)
+
+For the dispatcher-bug investigation specifically, the kernel-2 default in
+`quick_analysis.py` is sufficient — kernel 2 in the warmup loop is already
+steady-state overlap and exhibits the bug. The warmup-vs-timed distinction
+matters more if you're measuring *timing* (which we do via wallclock from
+`bench_overlap.py`'s scenarios, not from ATT).
+
 ### Output layout
 
 ```
@@ -264,38 +332,61 @@ torchrun --nproc_per_node=8 --no-python ./run_att.sh bench_overlap_only.py ...
 ### Quick analysis
 
 `quick_analysis.py` answers the headline question: *did the dispatcher
-oversubscribe any CU during kernel 1?*
+oversubscribe any CU during this overlap iteration?*
 
 ```bash
 python3 quick_analysis.py /tmp/att_out/ui_output_agent_*_dispatch_*/occupancy.json
 ```
 
-Output:
-```
-Total blocks: 228
-Distinct CUs used: 226
-Oversubscribed CUs (got 2 blocks): 2
-  XCD0 SE3 CU4: 2 blocks
-  XCD6 SE25 CU1: 2 blocks
-Late waves (start > earliest+1M): 8  (= 2 late blocks)
+By default it analyzes **kernel 2** of the captured kernels. Kernel 1 is the
+"cold" iteration where NCCL's first AG hasn't yet dispatched its RCCL waves,
+so the GPU sees GEMM in isolation — not representative of steady-state
+overlap. Kernel 2 (and later) are the real overlap case. To analyze a
+different kernel, pass its 1-based index:
+```bash
+python3 quick_analysis.py occupancy.json 1   # kernel 1 (cold)
+python3 quick_analysis.py occupancy.json 3   # kernel 3
 ```
 
-Reading this on the broken host (older amdgpu / firmware):
-
-- **228 blocks on 226 distinct CUs** → 2 CUs got 2 GEMM blocks each.
-- **Oversubscribed CUs** are non-deterministic across kernels; the colliding
-  CU varies per iter. This is the dispatcher race.
-- **Late blocks** start ~3.5M cycles after the others — they're waiting for
-  the *first* block on the colliding CU to finish before they can run. Wave
-  duration once started is normal (~3.5M cycles); the kernel can't end until
-  these last blocks finish, doubling its wallclock.
-
-On the fixed host, the same command reports:
+Output on the broken host (cv350, older amdgpu/firmware):
 ```
-Total blocks: 228
-Distinct CUs used: 228
-Oversubscribed CUs (got 2 blocks): 0
-Late waves (start > earliest+1M): 0
+Analyzing kernel 2 of 4 captured  (start ≈ 90,784,660 cycles)
+
+Total GEMM blocks:           228
+Distinct CUs hosting GEMM:   227
+Oversubscribed CUs (>1 GEMM): 1
+  XCD0 SE2 CU6: 2 blocks
+RCCL CUs concurrent:         16
+Truly idle CUs:              13
+  (sanity: 256 = 227 GEMM + 16 RCCL + 13 idle)
+Late-dispatching waves:      4  (= 1 late blocks)
+```
+
+How to read it:
+
+- **228 blocks on 227 distinct CUs** → 1 CU got 2 GEMM blocks (the bug).
+- **16 RCCL CUs concurrent** — RCCL has all 16 channels resident on disjoint
+  CUs during this kernel.
+- **13 idle CUs** — completely unused. *The bug isn't a CU shortage*: the
+  dispatcher chose to put 2 blocks on one CU while leaving 13 others empty.
+- **Oversubscribed CU is non-deterministic** across iterations — the
+  colliding CU varies per iter. That's the dispatcher race.
+- **Late-dispatching wave** starts ~3.5M cycles after the others — it's
+  waiting for the *first* block on the colliding CU to finish. Once it
+  starts, it runs for the normal ~3.5M cycles; the kernel can't end until
+  it finishes, ~doubling the wallclock.
+
+On the fixed host (smci355, newer amdgpu/firmware), the same command reports:
+```
+Analyzing kernel 2 of 4 captured  (start ≈ 92,717,764 cycles)
+
+Total GEMM blocks:           228
+Distinct CUs hosting GEMM:   228
+Oversubscribed CUs (>1 GEMM): 0
+RCCL CUs concurrent:         16
+Truly idle CUs:              12
+  (sanity: 256 = 228 GEMM + 16 RCCL + 12 idle)
+Late-dispatching waves:      0  (= 0 late blocks)
 ```
 
 ### Visualization in the GUI
