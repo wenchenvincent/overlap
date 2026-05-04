@@ -169,8 +169,74 @@ def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_
     return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu)
 
 
+def run_grouped_gemm_primus_triton(lhs, rhs, group_lens, out, M, K, N, G, grid_dim, num_xcds):
+    """Primus-Turbo Triton persistent grouped GEMM, with grid_dim mapped to NUM_SMS.
+
+    When `_primus_use_ws` is True, dispatches to the vendored work-stealing
+    kernel from `vendored_primus`. Otherwise calls the upstream static-stride
+    kernel directly.
+    """
+    if _primus_use_ws or _primus_use_autotune:
+        from vendored_primus import grouped_gemm_triton_kernel_ws
+        return grouped_gemm_triton_kernel_ws(
+            lhs, rhs, _primus_group_offs, _primus_ws_counter,
+            out=out,
+            num_sms=grid_dim,
+            num_xcds=num_xcds,
+            trans_b=_primus_trans_b,
+            work_steal=_primus_use_ws,
+            autotune=_primus_use_autotune,
+        )
+
+    from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+        _grouped_bf16_persistent_gemm_kernel,
+    )
+
+    if _primus_trans_b:
+        # rhs is [G, N, K]
+        stride_bn = rhs.stride(1)
+        stride_bk = rhs.stride(2)
+    else:
+        # rhs is [G, K, N]
+        stride_bk = rhs.stride(1)
+        stride_bn = rhs.stride(2)
+
+    _grouped_bf16_persistent_gemm_kernel[(grid_dim,)](
+        lhs, rhs, out, _primus_group_offs,
+        G, N, K,
+        lhs.stride(0),
+        rhs.stride(0),
+        stride_bn,
+        out.stride(0),
+        out.stride(1),
+        stride_ak=lhs.stride(1),
+        stride_bk=stride_bk,
+        BLOCK_SIZE_M=256,
+        BLOCK_SIZE_N=256,
+        BLOCK_SIZE_K=64,
+        GROUP_SIZE_M=4,
+        NUM_SMS=grid_dim,
+        NUM_XCDS=num_xcds,
+        CHUNK_SIZE=32,
+        EVEN_K=(K % 64 == 0),
+        CACHE_MODIFIER_A=".ca",
+        CACHE_MODIFIER_B=".ca",
+        num_warps=8,
+        num_stages=2,
+        waves_per_eu=2,
+        matrix_instr_nonkdim=16,
+        kpack=1,
+    )
+    return out
+
+
 # Default — overridden by main() based on --backend
 run_grouped_gemm = run_grouped_gemm_triton
+_primus_group_offs = None    # set in main() for the primus-triton backend
+_primus_use_ws = False       # set in main() when --ws is passed
+_primus_use_autotune = False # set in main() when --autotune is passed
+_primus_ws_counter = None    # allocated when --ws or --autotune is passed
+_primus_trans_b = False
 
 
 # ---------------------------------------------------------------------------
@@ -388,10 +454,22 @@ def main():
     parser.add_argument("--num-ag", type=int, default=1,
                         help="Number of concurrent all-gathers to launch during overlap")
     parser.add_argument("--backend", type=str, default="triton",
-                        choices=["triton", "primus"],
-                        help="Grouped GEMM backend: 'triton' (built-in) or 'primus' (Primus-Turbo CK)")
+                        choices=["triton", "primus", "primus-triton"],
+                        help="Grouped GEMM backend: 'triton' (built-in), "
+                             "'primus' (Primus-Turbo CK), or 'primus-triton' "
+                             "(Primus-Turbo persistent Triton kernel)")
     parser.add_argument("--trans-b", action="store_true",
-                        help="Use transposed weight layout [G, N, K] (Primus backend only)")
+                        help="Use transposed weight layout [G, N, K] "
+                             "(primus / primus-triton backends only)")
+    parser.add_argument("--ws", action="store_true",
+                        help="Enable per-XCD + global-fallback work stealing "
+                             "in the vendored primus-triton kernel "
+                             "(--backend primus-triton only, forward only)")
+    parser.add_argument("--autotune", action="store_true",
+                        help="Run the vendored primus-triton kernel through "
+                             "@triton.autotune over a small config sweep. "
+                             "First call per (G,N,K) takes ~10–30s; subsequent "
+                             "calls hit the cache. (--backend primus-triton only)")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -401,15 +479,25 @@ def main():
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
     backend = args.backend
 
-    global run_grouped_gemm, _primus_trans_b
+    global run_grouped_gemm, _primus_trans_b, _primus_use_ws, _primus_use_autotune
     _primus_trans_b = args.trans_b
+    _primus_use_ws = bool(args.ws)
+    _primus_use_autotune = bool(args.autotune)
+    if args.ws and backend != "primus-triton":
+        raise SystemExit("--ws is only supported with --backend primus-triton")
+    if args.autotune and backend != "primus-triton":
+        raise SystemExit("--autotune is only supported with --backend primus-triton")
     if backend == "triton":
         # Ensure K is divisible by BLOCK_K=64
         assert K % 64 == 0, f"K={K} must be divisible by 64"
-        assert not args.trans_b, "--trans-b is only supported with --backend primus"
+        assert not args.trans_b, "--trans-b requires --backend primus or primus-triton"
         run_grouped_gemm = run_grouped_gemm_triton
-    else:
+    elif backend == "primus":
         run_grouped_gemm = run_grouped_gemm_primus
+    else:
+        # primus-triton: kernel uses BLOCK_SIZE_K=64
+        assert K % 64 == 0, f"K={K} must be divisible by 64"
+        run_grouped_gemm = run_grouped_gemm_primus_triton
 
     nccl_max_nchannels = os.environ.get("NCCL_MAX_NCHANNELS", "")
 
@@ -434,9 +522,31 @@ def main():
     gs_list = [group_size_val] * G
     if remainder > 0:
         gs_list[-1] += remainder
-    gs_dtype = torch.int64 if backend == "primus" else torch.int32
+    gs_dtype = torch.int32 if backend == "triton" else torch.int64
     group_sizes = torch.tensor(gs_list, dtype=gs_dtype, device=device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
+
+    # primus-triton kernel needs prefix-sum offsets [G+1] int64; compute once.
+    if backend == "primus-triton":
+        global _primus_group_offs, _primus_ws_counter
+        offs = torch.zeros(G + 1, dtype=torch.int64, device=device)
+        offs[1:] = torch.cumsum(group_sizes.to(torch.int64), dim=0)
+        _primus_group_offs = offs
+        # Counter buffer is required whenever the vendored kernel is used —
+        # both the WS path and the autotuned launch (which calls reset_to_zero
+        # on it across trials).
+        if args.ws or args.autotune:
+            from vendored_primus import allocate_ws_counter_buf
+            _primus_ws_counter = allocate_ws_counter_buf(device, num_xcds=args.num_xcds)
+            if rank == 0:
+                modes = []
+                if args.ws:
+                    modes.append("work-stealing")
+                if args.autotune:
+                    modes.append("autotune")
+                print(f"Vendored primus-triton kernel: {' + '.join(modes)} "
+                      f"(counter buf {_primus_ws_counter.numel()} int32)",
+                      file=sys.stderr)
 
     ag_numel = args.ag_size_mb * 1024 * 1024 // 2  # bf16 = 2 bytes
     num_ag = args.num_ag

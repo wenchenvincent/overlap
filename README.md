@@ -19,6 +19,25 @@ NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
   --G 32 --M 267424 --K 1280 --N 2560 \
   --ag-size-mb 512 --grid-dims 240
 
+# Primus-Turbo Triton grouped GEMM (upstream, static-stride persistent loop)
+NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
+  --backend primus-triton --trans-b \
+  --G 32 --M 267424 --K 1280 --N 2560 \
+  --ag-size-mb 512 --grid-dims 240,256
+
+# Same kernel + per-XCD work stealing (vendored fork; recovers most of the
+# overlap slowdown at grid=256 without partitioning CUs)
+NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
+  --backend primus-triton --trans-b \
+  --G 32 --M 267424 --K 1280 --N 2560 \
+  --ag-size-mb 512 --grid-dims 240,256 --ws
+
+# Add Triton autotune over a 15-config sweep on top of work stealing
+NCCL_MAX_NCHANNELS=16 torchrun --nproc_per_node=8 bench_overlap.py \
+  --backend primus-triton --trans-b \
+  --G 32 --M 267424 --K 1280 --N 2560 \
+  --ag-size-mb 512 --grid-dims 240,256 --ws --autotune
+
 # Colleague's test script
 NCCL_MAX_NCHANNELS=16 NUM_CU=240 TEST_OVERLAP_TRACE_DIR=./traces python3 test_overlap.py
 ```
@@ -28,6 +47,8 @@ NCCL_MAX_NCHANNELS=16 NUM_CU=240 TEST_OVERLAP_TRACE_DIR=./traces python3 test_ov
 | File | Description |
 |---|---|
 | `bench_overlap.py` | Main reproducer. Triton or Primus-Turbo CK grouped GEMM + RCCL all-gather overlap benchmark with CUDA event timing. |
+| `vendored_primus/` | Vendored fork of `primus_turbo`'s persistent grouped-GEMM Triton kernel with an added per-XCD + global-fallback work-stealing path and an opt-in `@triton.autotune` config sweep. Modeled on tritonBLAS `persistent_gemm_work_stealing.py`. Used by `--backend primus-triton --ws [--autotune]`. |
+| `test_ws_correctness.py` | Single-GPU correctness harness: runs the vendored WS kernel and the upstream static-stride kernel on identical inputs and asserts bit-for-bit (or near-bit-for-bit) agreement across G ∈ {1, 8, 32} and a range of M, K, N, trans_b. |
 | `test_overlap.py` | Three-phase test (AG only, GEMM only, overlapped) with PyTorch profiler trace export and multi-rank trace merging. |
 | `grouped_gemm_ops.py` | Primus-Turbo grouped GEMM wrapper (fprop/dgrad/wgrad) with `num_cu` parameter. |
 | `bench_cu_occupancy.py` | Controlled experiment: synthetic CU occupier kernel + grouped GEMM to measure slowdown as a function of stolen CUs. |
@@ -110,6 +131,57 @@ Evidence:
 - The synthetic CU occupier experiment shows that CU exclusion alone (without memory
   traffic) produces less slowdown than real RCCL overlap
 
+### 7. Work stealing recovers most of the overlap slowdown without CU partitioning
+
+The vendored `primus-triton` kernel adds a hierarchical work-stealing path
+(`--ws`): each of the 8 XCDs owns a contiguous slice of `total_tiles` and its
+32 CUs race on a single padded atomic counter; faster CUs claim more tiles
+when stragglers (e.g. CUs preempted by RCCL) lag. A global counter handles the
+ragged tail. With `--autotune` on top, Triton sweeps 15 candidate configs
+(BLOCK_M/N/K, num_warps, num_stages, waves_per_eu, kpack, matrix_instr_nonkdim)
+and caches the winner per `(G, N, K)`.
+
+All numbers below: G=32, M=267424, K=1280, N=2560, trans_b, 8x MI355X,
+NCCL_MAX_NCHANNELS=16.
+
+| Variant | grid | gemm_only (mean / min) | overlap_gemm | Slowdown |
+|---|---:|---:|---:|---:|
+| Primus CK | 240 | 1.88 / 1.69 ms | 2.39 ms | 1.10× |
+| Primus CK | 256 | 2.00 / 1.83 ms | 3.48 ms | 1.74× |
+| primus-triton (static) | 240 | 2.17 / 2.13 ms | 2.39 ms | 1.10× |
+| primus-triton (static) | 256 | 2.12 / 2.05 ms | 4.29 ms | 2.03× |
+| primus-triton `--ws` | 240 | 2.25 / 2.15 ms | 2.47 ms | 1.10× |
+| primus-triton `--ws` | 256 | 2.10 / 2.05 ms | 2.46 ms | **1.17×** |
+| primus-triton `--ws --autotune` | 240 | 1.96 / 1.91 ms | 2.22 ms | 1.13× |
+| primus-triton `--ws --autotune` | 256 | 2.05 / **1.85 ms** | **2.22 ms** | **1.09×** |
+
+Key takeaways:
+
+- **Without WS**: at grid=256 the Triton kernel slows 2.03× under overlap.
+  Capping the grid to 240 fully recovers it but is workload-specific
+  hand-tuning.
+- **With `--ws`** at grid=256: slowdown drops to 1.17×. Intra-XCD stealing
+  rebalances tiles automatically when some CUs are slowed by RCCL
+  contention — no need to pick a "right" CU count.
+- **With `--ws --autotune`** at grid=256: slowdown **1.09×** and the absolute
+  overlap_gemm time (2.22 ms) is the **best of any variant**, beating even
+  Primus CK with hand-tuned partitioning (2.39 ms at grid=240). Autotune's
+  contribution here is mostly in re-tuning per-NUM_SMS specialization;
+  the chosen config for `(G=32, N=2560, K=1280)` matches the upstream default
+  but for other shapes (G=4, K=1024 etc.) it picks `matrix_instr_nonkdim=32`
+  or `num_stages=3`.
+- **No-overlap overhead of WS**: ~1% by min times. Eight padded per-XCD
+  atomics are essentially free. For autotune the first call per `(G,N,K)`
+  spends 10–30 s on the search; subsequent calls hit the cache.
+
+Under heavy uniform contention (NCCL_MAX_NCHANNELS=112) WS still helps but
+less dramatically (slowdown ~1.94× at grid=256 with WS vs 2.08× without) —
+when every XCD is equally squeezed, there's less per-CU imbalance for
+stealing to exploit. The tritonBLAS-style hierarchical fallback to a global
+counter is wired in (handles the ragged tail) but a fractional reservation
+that would force meaningful cross-XCD stealing under uniform contention is
+left as future work.
+
 ## Environment
 
 Tested on:
@@ -131,8 +203,13 @@ Tested on:
 --iters          Measurement iterations (default: 20)
 --profile        Enable PyTorch profiler trace export
 --num-ag         Number of concurrent all-gathers (default: 1)
---backend        "triton" or "primus" (default: "triton")
---trans-b        Use transposed weight layout [G, N, K] (Primus only)
+--backend        "triton", "primus", or "primus-triton" (default: "triton")
+--trans-b        Use transposed weight layout [G, N, K] (Primus / primus-triton only)
+--ws             Enable per-XCD + global-fallback work stealing in the
+                 vendored primus-triton kernel (forward only)
+--autotune       Run the vendored primus-triton kernel through @triton.autotune
+                 over a small config sweep (~10–30s search per (G,N,K) on the
+                 first call; cached afterwards). Combine with --ws.
 ```
 
 ## Profiling
