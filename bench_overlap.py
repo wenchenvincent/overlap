@@ -469,14 +469,17 @@ def main():
                         help="Enable per-XCD + global-fallback work stealing "
                              "in the vendored primus-triton kernel "
                              "(--backend primus-triton only, forward only)")
-    parser.add_argument("--ws-mode", choices=["auto", "per-xcd", "global", "hierarchical"],
+    parser.add_argument("--ws-mode", choices=["auto", "per-xcd", "global", "hierarchical", "quota"],
                         default="auto",
                         help="Work-stealing mode (--ws only). 'auto' applies "
                              "the tritonBLAS tiles-per-CU heuristic: "
                              "per-XCD-only when sparse (≤4 tiles/CU), "
                              "hierarchical (50–100%% phase-1) otherwise. "
                              "'per-xcd' / 'global' / 'hierarchical' force a "
-                             "specific mode, useful for A/B comparison.")
+                             "specific mode. 'quota' is scxiao's variant: "
+                             "single global counter with each CU running a "
+                             "fixed ceil(total_tiles/NUM_SMS) iterations "
+                             "(static load, dynamic tile-ID assignment).")
     parser.add_argument("--autotune", action="store_true",
                         help="Run the vendored primus-triton kernel through "
                              "@triton.autotune over a small config sweep. "

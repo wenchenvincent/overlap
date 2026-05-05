@@ -96,7 +96,7 @@ def main():
     ]
 
     print(f"NUM_SMS={num_sms}, NUM_XCDS={NUM_XCDS}")
-    modes = ("auto", "per-xcd", "global", "hierarchical")
+    modes = ("auto", "per-xcd", "global", "hierarchical", "quota")
     all_ok = True
     for G, M, K, N, trans_b in cases:
         a, b, offs = _make_inputs(G, M, K, N, trans_b, device)

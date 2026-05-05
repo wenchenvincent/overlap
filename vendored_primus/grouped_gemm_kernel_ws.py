@@ -240,6 +240,7 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     CACHE_MODIFIER_B: tl.constexpr,
     WORK_STEAL: tl.constexpr,
     COUNTER_STRIDE: tl.constexpr,
+    QUOTA_MODE: tl.constexpr = False,
     ALLOW_TF32: tl.constexpr = torch.backends.cuda.matmul.allow_tf32,
 ):
     pid = tl.program_id(0)
@@ -260,7 +261,43 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    if WORK_STEAL:
+    if WORK_STEAL and QUOTA_MODE:
+        # ── Fixed per-CU quota with single global counter ──
+        # Adapted from scxiao's branch
+        # (https://github.com/scxiao/Primus-Turbo/tree/ws_groupgemm).
+        #
+        # Each CU does exactly ceil(total_tiles / NUM_SMS) atomic_adds — load
+        # is static per CU, only the *tile IDs* each CU receives are dynamic
+        # (assigned by the global atomic order). Differs from `WS_MODE=global`
+        # in this kernel, which uses `while atomic_add < total_tiles` and so
+        # lets fast CUs absorb work that slow CUs would otherwise have done.
+        # Quota mode pays exactly `total_tiles` atomic_adds total (no
+        # over-claim), but loses straggler-tolerance.
+        tiles_per_sm = total_tiles // NUM_SMS
+        if pid < total_tiles % NUM_SMS:
+            tiles_per_sm += 1
+        for _ in range(0, tiles_per_sm):
+            tile_id = tl.atomic_add(
+                global_counter_ptr, 1, sem="relaxed", scope="gpu"
+            )
+            _process_grouped_gemm_tile(
+                tile_id,
+                A, B, C, group_offs_ptr,
+                G, N, K,
+                stride_am, stride_bg, stride_bn, stride_cm, stride_cn,
+                num_pid_n,
+                stride_ak=stride_ak,
+                stride_bk=stride_bk,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                GROUP_SIZE_M=GROUP_SIZE_M,
+                EVEN_K=EVEN_K,
+                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
+                ALLOW_TF32=ALLOW_TF32,
+            )
+    elif WORK_STEAL:
         # ── Per-XCD slot + global fallback (hierarchical) ──
         #
         # Phase 1: each XCD owns the contiguous slice
@@ -470,6 +507,9 @@ def resolve_local_per_xcd(total_tiles: int, num_sms: int, num_xcds: int,
         "global"  — phase 1 is empty; all work via the global counter.
                     local_per_xcd = 0.
         "hierarchical" — apply tritonBLAS's adaptive split unconditionally.
+        "quota"   — fixed per-CU quota loop (scxiao's variant). The kernel
+                    ignores local_per_xcd in this mode; we return 0 for
+                    consistency.
         "auto" (default) — apply tritonBLAS's heuristic with the
                     `tiles_per_cu <= 4` short-circuit to "per-xcd"
                     (matches their stated reasoning that the global atomic
@@ -480,7 +520,7 @@ def resolve_local_per_xcd(total_tiles: int, num_sms: int, num_xcds: int,
         local_frac = max(0.5, 1.0 - max(0, tiles_per_cu - 4) * 0.05)
         local_per_xcd = max(1, int(total_tiles * local_frac) // num_xcds)
     """
-    if ws_mode == "global":
+    if ws_mode in ("global", "quota"):
         return 0
     if ws_mode == "per-xcd":
         return (total_tiles + num_xcds - 1) // num_xcds
@@ -617,6 +657,7 @@ def grouped_gemm_triton_kernel_ws(
         CACHE_MODIFIER_B=".ca",
         WORK_STEAL=work_steal,
         COUNTER_STRIDE=COUNTER_STRIDE,
+        QUOTA_MODE=(work_steal and ws_mode == "quota"),
     )
 
     if autotune:
