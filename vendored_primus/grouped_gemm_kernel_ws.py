@@ -225,6 +225,7 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
     stride_bn,
     stride_cm,
     stride_cn,
+    local_per_xcd,
     stride_ak: tl.constexpr,
     stride_bk: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -264,72 +265,77 @@ def _grouped_bf16_persistent_gemm_kernel_ws(
         #
         # Phase 1: each XCD owns the contiguous slice
         #   [xcd_id * per_xcd, (xcd_id + 1) * per_xcd)
-        # of tile space, with `per_xcd = total_tiles // NUM_XCDS` (floor).
+        # of tile space, with `per_xcd = local_per_xcd` supplied by the host.
         # All 32 CUs of an XCD race on a single padded counter; faster CUs
         # claim more tiles, automatically rebalancing within an XCD when
         # some CUs are slowed by RCCL contention. The contiguous partition
         # preserves L2 locality: consecutive tiles share B[g] data.
         #
-        # Phase 2: tiles [per_xcd * NUM_XCDS, total_tiles) (the ragged tail)
-        # are claimed via a single global counter by whichever CU finishes
-        # phase 1 first. This also handles the total_tiles < NUM_XCDS case
-        # where phase 1 has zero work per XCD.
+        # Phase 2: tiles [per_xcd * NUM_XCDS, total_tiles) are claimed via a
+        # single global counter by whichever CU finishes phase 1 first. The
+        # host chooses how much work to reserve for phase 2 via the
+        # `local_per_xcd` knob: tritonBLAS's tiles-per-CU heuristic picks
+        # ~50% of total_tiles for phase 2 on dense workloads (cross-XCD
+        # stealing), and 100% phase-1 (no global work) for sparse ones
+        # (≤4 tiles/CU) where the global atomic overhead dominates. Special
+        # cases:
+        #   local_per_xcd = ceil(total_tiles / NUM_XCDS)  → per-XCD only
+        #                                                  (phase 2 is empty)
+        #   local_per_xcd = 0                             → global only
+        #                                                  (phase 1 is empty)
+        #   intermediate                                  → hierarchical
         #
         # AMD pid → XCD mapping is round-robin: pid % NUM_XCDS.
         xcd_id = pid % NUM_XCDS
         local_counter = tile_counter_ptr + xcd_id * COUNTER_STRIDE
-        per_xcd = total_tiles // NUM_XCDS
-        phase1_total = per_xcd * NUM_XCDS
+        per_xcd = local_per_xcd.to(tl.int32)
+        phase1_total = (per_xcd * NUM_XCDS).to(tl.int32)
 
-        # Phase 1: drain own XCD slice. Triton does not support `break`, so
-        # the atomic_add is hoisted into the while-condition: each iteration
-        # claims a tile only if local_idx < per_xcd.
+        # Single unified loop with one call site for the per-tile body.
+        # We previously used two separate while loops (phase 1 then phase 2),
+        # but inlining `_process_grouped_gemm_tile` twice in the same kernel
+        # produced NaN in the phase-2 outputs on this kernel + Triton-AMD
+        # backend, even with no register spilling reported. Folding both
+        # phases into one while loop, with a single helper call, sidesteps
+        # the issue: each iteration claims a tile from either the local
+        # (phase-1) or global (phase-2) counter and feeds it to the body.
         local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
-        while local_idx < per_xcd:
-            global_tile_id = xcd_id * per_xcd + local_idx
-            _process_grouped_gemm_tile(
-                global_tile_id,
-                A, B, C, group_offs_ptr,
-                G, N, K,
-                stride_am, stride_bg, stride_bn, stride_cm, stride_cn,
-                num_pid_n,
-                stride_ak=stride_ak,
-                stride_bk=stride_bk,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=GROUP_SIZE_M,
-                EVEN_K=EVEN_K,
-                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
-                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
-                ALLOW_TF32=ALLOW_TF32,
-            )
-            local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
-
-        # Phase 2: global fallback for the ragged tail
-        # [phase1_total, total_tiles).
-        g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
-        global_tile_id = phase1_total + g_idx
-        while global_tile_id < total_tiles:
-            _process_grouped_gemm_tile(
-                global_tile_id,
-                A, B, C, group_offs_ptr,
-                G, N, K,
-                stride_am, stride_bg, stride_bn, stride_cm, stride_cn,
-                num_pid_n,
-                stride_ak=stride_ak,
-                stride_bk=stride_bk,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=GROUP_SIZE_M,
-                EVEN_K=EVEN_K,
-                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
-                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
-                ALLOW_TF32=ALLOW_TF32,
-            )
+        in_phase2 = local_idx >= per_xcd
+        if in_phase2:
             g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
-            global_tile_id = phase1_total + g_idx
+            tile_id = phase1_total + g_idx
+        else:
+            tile_id = xcd_id * per_xcd + local_idx
+
+        while tile_id < total_tiles:
+            _process_grouped_gemm_tile(
+                tile_id,
+                A, B, C, group_offs_ptr,
+                G, N, K,
+                stride_am, stride_bg, stride_bn, stride_cm, stride_cn,
+                num_pid_n,
+                stride_ak=stride_ak,
+                stride_bk=stride_bk,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                GROUP_SIZE_M=GROUP_SIZE_M,
+                EVEN_K=EVEN_K,
+                CACHE_MODIFIER_A=CACHE_MODIFIER_A,
+                CACHE_MODIFIER_B=CACHE_MODIFIER_B,
+                ALLOW_TF32=ALLOW_TF32,
+            )
+            if in_phase2:
+                g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
+                tile_id = phase1_total + g_idx
+            else:
+                local_idx = tl.atomic_add(local_counter, 1, sem="relaxed", scope="gpu")
+                if local_idx >= per_xcd:
+                    in_phase2 = True
+                    g_idx = tl.atomic_add(global_counter_ptr, 1, sem="relaxed", scope="gpu")
+                    tile_id = phase1_total + g_idx
+                else:
+                    tile_id = xcd_id * per_xcd + local_idx
     else:
         # Static-stride persistent loop (matches upstream behaviour).
         if NUM_XCDS != 1:
@@ -425,6 +431,72 @@ _grouped_bf16_persistent_gemm_kernel_ws_autotune = triton.autotune(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Mode-selection helpers (host-side).
+#
+# tritonBLAS's `hierarchical_split()` (defined but currently unused in their
+# matmul.py) picks a fraction of total_tiles to reserve for the global counter
+# based on tiles-per-CU density. We adopt the same heuristic so phase 2 has
+# real work to do — v1 with `per_xcd = total_tiles // NUM_XCDS` left phase 2
+# with only the 0–7 ragged-tail tiles, defeating cross-XCD stealing.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def compute_total_tiles_host(group_lens, N: int,
+                             block_m: int = 256, block_n: int = 256) -> int:
+    """Compute total persistent tiles for the kernel, host-side.
+
+    Args:
+        group_lens: per-group row counts. Either a Python sequence of ints or
+            a 1-D torch tensor (CPU or CUDA — will be moved to CPU once).
+        N: output column count.
+        block_m, block_n: must match the kernel's BLOCK_SIZE_M / BLOCK_SIZE_N.
+
+    Returns:
+        sum_g( ceil(M_g / block_m) ) * ceil(N / block_n)
+    """
+    if isinstance(group_lens, torch.Tensor):
+        group_lens = group_lens.cpu().tolist()
+    num_pid_n = (N + block_n - 1) // block_n
+    return sum((m_g + block_m - 1) // block_m for m_g in group_lens) * num_pid_n
+
+
+def resolve_local_per_xcd(total_tiles: int, num_sms: int, num_xcds: int,
+                          ws_mode: str = "auto") -> int:
+    """Map `ws_mode` + workload size to the per-XCD phase-1 tile budget.
+
+    Modes:
+        "per-xcd" — phase 1 covers everything; phase 2 is empty.
+                    local_per_xcd = ceil(total_tiles / num_xcds).
+        "global"  — phase 1 is empty; all work via the global counter.
+                    local_per_xcd = 0.
+        "hierarchical" — apply tritonBLAS's adaptive split unconditionally.
+        "auto" (default) — apply tritonBLAS's heuristic with the
+                    `tiles_per_cu <= 4` short-circuit to "per-xcd"
+                    (matches their stated reasoning that the global atomic
+                    overhead dominates when work is sparse).
+
+    Heuristic (from tritonBLAS hierarchical_split, lifted verbatim):
+        tiles_per_cu = total_tiles / num_sms
+        local_frac = max(0.5, 1.0 - max(0, tiles_per_cu - 4) * 0.05)
+        local_per_xcd = max(1, int(total_tiles * local_frac) // num_xcds)
+    """
+    if ws_mode == "global":
+        return 0
+    if ws_mode == "per-xcd":
+        return (total_tiles + num_xcds - 1) // num_xcds
+
+    tiles_per_cu = total_tiles / max(num_sms, 1)
+    if ws_mode == "auto" and tiles_per_cu <= 4.0:
+        # Below the threshold: per-XCD only. Global atomic overhead would
+        # dominate when there's not enough work to amortise it.
+        return (total_tiles + num_xcds - 1) // num_xcds
+
+    # auto (dense) or explicit "hierarchical": adaptive split.
+    local_frac = max(0.5, 1.0 - max(0.0, tiles_per_cu - 4.0) * 0.05)
+    return max(1, int(total_tiles * local_frac) // num_xcds)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Host wrapper — same shape as upstream `grouped_gemm_triton_kernel` but takes
 # a counter buffer (allocated by the caller, zeroed on the active stream here).
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -442,6 +514,8 @@ def grouped_gemm_triton_kernel_ws(
     trans_b: bool = False,
     work_steal: bool = True,
     autotune: bool = False,
+    ws_mode: str = "auto",
+    total_tiles: Optional[int] = None,
 ) -> torch.Tensor:
     """Persistent grouped GEMM with optional per-XCD + global work stealing.
 
@@ -462,6 +536,12 @@ def grouped_gemm_triton_kernel_ws(
             over `_AUTOTUNE_CONFIGS`. First call for a given (G, N, K) triggers
             a search (~10–30 s wall, depending on config count); subsequent
             calls reuse the cached winner.
+        ws_mode: one of "auto" (default, tritonBLAS heuristic), "per-xcd"
+            (phase 2 empty), "global" (phase 1 empty), or "hierarchical"
+            (always apply the adaptive split). Ignored when `work_steal=False`.
+        total_tiles: optional precomputed total persistent tile count; saves
+            a tiny CPU-side reduction over `group_offs`. Caller may use
+            `compute_total_tiles_host()` once at startup and pass it here.
     """
     assert a.ndim == 2, f"a must be 2D, got {a.shape}"
     assert b.ndim == 3, f"b must be 3D, got {b.shape}"
@@ -508,6 +588,21 @@ def grouped_gemm_triton_kernel_ws(
     tile_counter_ptr = counter_buf
     global_counter_ptr = counter_buf[num_xcds * COUNTER_STRIDE :]
 
+    # Resolve phase-1 size on the host. When the kernel runs with
+    # WORK_STEAL=False the kernel ignores `local_per_xcd`; we still pass a
+    # sensible value (0) to keep the launch site uniform.
+    if work_steal:
+        if total_tiles is None:
+            # Derive group lengths from the prefix sum.
+            offs = group_offs.cpu().tolist()
+            group_lens = [offs[g + 1] - offs[g] for g in range(len(offs) - 1)]
+            total_tiles = compute_total_tiles_host(group_lens, N)
+        local_per_xcd = resolve_local_per_xcd(
+            total_tiles, num_sms, num_xcds, ws_mode
+        )
+    else:
+        local_per_xcd = 0
+
     even_k = K % 64 == 0
 
     common_kwargs = dict(
@@ -548,6 +643,7 @@ def grouped_gemm_triton_kernel_ws(
         G, N, K,
         a.stride(0), b.stride(0), stride_bn,
         out.stride(0), out.stride(1),
+        local_per_xcd,
         **common_kwargs,
         **extra,
     )

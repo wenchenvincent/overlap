@@ -11,6 +11,8 @@ from .grouped_gemm_kernel_ws import (
     _grouped_bf16_persistent_gemm_kernel_ws,
     grouped_gemm_triton_kernel_ws,
     allocate_ws_counter_buf,
+    compute_total_tiles_host,
+    resolve_local_per_xcd,
 )
 
 __all__ = [
@@ -19,4 +21,6 @@ __all__ = [
     "_grouped_bf16_persistent_gemm_kernel_ws",
     "grouped_gemm_triton_kernel_ws",
     "allocate_ws_counter_buf",
+    "compute_total_tiles_host",
+    "resolve_local_per_xcd",
 ]

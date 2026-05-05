@@ -17,7 +17,9 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
 from vendored_primus import (
     NUM_XCDS,
     allocate_ws_counter_buf,
+    compute_total_tiles_host,
     grouped_gemm_triton_kernel_ws,
+    resolve_local_per_xcd,
 )
 
 
@@ -94,38 +96,48 @@ def main():
     ]
 
     print(f"NUM_SMS={num_sms}, NUM_XCDS={NUM_XCDS}")
+    modes = ("auto", "per-xcd", "global", "hierarchical")
     all_ok = True
     for G, M, K, N, trans_b in cases:
         a, b, offs = _make_inputs(G, M, K, N, trans_b, device)
         out_static = _run_static(a, b, offs, num_sms, NUM_XCDS, trans_b)
-        out_ws = grouped_gemm_triton_kernel_ws(
-            a, b, offs, counter_buf,
-            num_sms=num_sms,
-            num_xcds=NUM_XCDS,
-            trans_b=trans_b,
-            work_steal=True,
-        )
-        torch.cuda.synchronize()
+        offs_cpu = offs.cpu().tolist()
+        group_lens = [offs_cpu[g + 1] - offs_cpu[g] for g in range(G)]
+        total_tiles = compute_total_tiles_host(group_lens, N)
 
-        # bf16 → fp32 for comparison; tolerances match a single bf16 ulp at scale.
-        diff = (out_static.float() - out_ws.float()).abs()
-        rel = diff / out_static.float().abs().clamp_min(1.0)
-        max_abs = diff.max().item()
-        max_rel = rel.max().item()
-        # Counter sanity: phase-1 slots should each hit at least per_xcd; the
-        # global slot is non-zero only when contention forced phase 2.
-        c = counter_buf.cpu()
-        slot_vals = [c[i * 64].item() for i in range(NUM_XCDS)]
-        global_val = c[NUM_XCDS * 64].item()
+        for mode in modes:
+            local_per_xcd = resolve_local_per_xcd(
+                total_tiles, num_sms, NUM_XCDS, mode
+            )
+            out_ws = grouped_gemm_triton_kernel_ws(
+                a, b, offs, counter_buf,
+                num_sms=num_sms,
+                num_xcds=NUM_XCDS,
+                trans_b=trans_b,
+                work_steal=True,
+                ws_mode=mode,
+                total_tiles=total_tiles,
+            )
+            torch.cuda.synchronize()
 
-        ok = max_abs < 5e-2 and max_rel < 5e-2
-        all_ok &= ok
-        status = "PASS" if ok else "FAIL"
-        print(
-            f"  G={G:>3} M={M:>7} K={K:>5} N={N:>5} trans_b={trans_b!s:<5} "
-            f"max_abs={max_abs:.2e} max_rel={max_rel:.2e} "
-            f"slots={slot_vals} global={global_val} [{status}]"
-        )
+            diff = (out_static.float() - out_ws.float()).abs()
+            rel = diff / out_static.float().abs().clamp_min(1.0)
+            max_abs = diff.max().item()
+            max_rel = rel.max().item()
+            c = counter_buf.cpu()
+            slot_min = min(c[i * 64].item() for i in range(NUM_XCDS))
+            slot_max = max(c[i * 64].item() for i in range(NUM_XCDS))
+            global_val = c[NUM_XCDS * 64].item()
+
+            ok = max_abs < 5e-2 and max_rel < 5e-2
+            all_ok &= ok
+            status = "PASS" if ok else "FAIL"
+            print(
+                f"  G={G:>3} M={M:>7} N={N:>5} trans_b={trans_b!s:<5} "
+                f"mode={mode:<13s} L/X={local_per_xcd:>5d} "
+                f"max_abs={max_abs:.1e} "
+                f"slots[{slot_min}..{slot_max}] global={global_val} [{status}]"
+            )
 
     print("ALL PASS" if all_ok else "FAILED")
     raise SystemExit(0 if all_ok else 1)

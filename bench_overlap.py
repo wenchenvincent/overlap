@@ -186,6 +186,8 @@ def run_grouped_gemm_primus_triton(lhs, rhs, group_lens, out, M, K, N, G, grid_d
             trans_b=_primus_trans_b,
             work_steal=_primus_use_ws,
             autotune=_primus_use_autotune,
+            ws_mode=_primus_ws_mode,
+            total_tiles=_primus_total_tiles,
         )
 
     from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
@@ -236,6 +238,8 @@ _primus_group_offs = None    # set in main() for the primus-triton backend
 _primus_use_ws = False       # set in main() when --ws is passed
 _primus_use_autotune = False # set in main() when --autotune is passed
 _primus_ws_counter = None    # allocated when --ws or --autotune is passed
+_primus_ws_mode = "auto"     # set in main() from --ws-mode
+_primus_total_tiles = None   # cached host-side total_tiles
 _primus_trans_b = False
 
 
@@ -465,6 +469,14 @@ def main():
                         help="Enable per-XCD + global-fallback work stealing "
                              "in the vendored primus-triton kernel "
                              "(--backend primus-triton only, forward only)")
+    parser.add_argument("--ws-mode", choices=["auto", "per-xcd", "global", "hierarchical"],
+                        default="auto",
+                        help="Work-stealing mode (--ws only). 'auto' applies "
+                             "the tritonBLAS tiles-per-CU heuristic: "
+                             "per-XCD-only when sparse (≤4 tiles/CU), "
+                             "hierarchical (50–100%% phase-1) otherwise. "
+                             "'per-xcd' / 'global' / 'hierarchical' force a "
+                             "specific mode, useful for A/B comparison.")
     parser.add_argument("--autotune", action="store_true",
                         help="Run the vendored primus-triton kernel through "
                              "@triton.autotune over a small config sweep. "
@@ -479,10 +491,11 @@ def main():
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
     backend = args.backend
 
-    global run_grouped_gemm, _primus_trans_b, _primus_use_ws, _primus_use_autotune
+    global run_grouped_gemm, _primus_trans_b, _primus_use_ws, _primus_use_autotune, _primus_ws_mode
     _primus_trans_b = args.trans_b
     _primus_use_ws = bool(args.ws)
     _primus_use_autotune = bool(args.autotune)
+    _primus_ws_mode = args.ws_mode
     if args.ws and backend != "primus-triton":
         raise SystemExit("--ws is only supported with --backend primus-triton")
     if args.autotune and backend != "primus-triton":
@@ -528,7 +541,7 @@ def main():
 
     # primus-triton kernel needs prefix-sum offsets [G+1] int64; compute once.
     if backend == "primus-triton":
-        global _primus_group_offs, _primus_ws_counter
+        global _primus_group_offs, _primus_ws_counter, _primus_total_tiles
         offs = torch.zeros(G + 1, dtype=torch.int64, device=device)
         offs[1:] = torch.cumsum(group_sizes.to(torch.int64), dim=0)
         _primus_group_offs = offs
@@ -536,17 +549,34 @@ def main():
         # both the WS path and the autotuned launch (which calls reset_to_zero
         # on it across trials).
         if args.ws or args.autotune:
-            from vendored_primus import allocate_ws_counter_buf
+            from vendored_primus import (
+                allocate_ws_counter_buf,
+                compute_total_tiles_host,
+                resolve_local_per_xcd,
+            )
             _primus_ws_counter = allocate_ws_counter_buf(device, num_xcds=args.num_xcds)
+            # Cache total_tiles on the host so the wrapper doesn't redo the
+            # group_offs.cpu() reduction each call.
+            _primus_total_tiles = compute_total_tiles_host(gs_list, N)
             if rank == 0:
                 modes = []
                 if args.ws:
-                    modes.append("work-stealing")
+                    modes.append(f"work-stealing[{args.ws_mode}]")
                 if args.autotune:
                     modes.append("autotune")
                 print(f"Vendored primus-triton kernel: {' + '.join(modes)} "
-                      f"(counter buf {_primus_ws_counter.numel()} int32)",
+                      f"(counter buf {_primus_ws_counter.numel()} int32, "
+                      f"total_tiles={_primus_total_tiles})",
                       file=sys.stderr)
+                if args.ws:
+                    for gd in grid_dims:
+                        lpx = resolve_local_per_xcd(
+                            _primus_total_tiles, gd, args.num_xcds, args.ws_mode)
+                        phase2 = max(0, _primus_total_tiles - lpx * args.num_xcds)
+                        print(f"  ws_mode={args.ws_mode} grid_dim={gd}: "
+                              f"local_per_xcd={lpx} (phase1={lpx * args.num_xcds}, "
+                              f"phase2={phase2} of {_primus_total_tiles})",
+                              file=sys.stderr)
 
     ag_numel = args.ag_size_mb * 1024 * 1024 // 2  # bf16 = 2 bytes
     num_ag = args.num_ag
