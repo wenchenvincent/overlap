@@ -169,6 +169,29 @@ def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_
     return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu)
 
 
+def run_grouped_gemm_aiter_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, _num_xcds):
+    """AITER's Triton GMM (aiter.ops.triton.gmm).
+
+    AITER infers TRANS_RHS from rhs strides:
+      - shape (G, K, N), strides (K*N, N, 1)  → row-major  → TRANS_RHS=False
+      - shape (G, K, N), strides (K*N, 1, K)  → col-major  → TRANS_RHS=True
+
+    Our `--trans-b` allocates rhs as `[G, N, K]` row-major. Calling
+    `.transpose(1, 2)` produces a (G, K, N) view with col-major strides —
+    no copy, satisfies AITER's col-major invariant.
+
+    `grid_dim` overrides AITER's auto-tuned GRID_DIM so the swept value from
+    --grid-dims actually applies. Other config knobs (block sizes, num_warps,
+    num_stages) are taken from AITER's get_config().
+    """
+    from aiter.ops.triton.gmm import gmm, get_config
+
+    rhs_aiter = rhs.transpose(1, 2) if _primus_trans_b else rhs
+    cfg = get_config("gmm", M, K, N, G)
+    cfg["GRID_DIM"] = grid_dim
+    return gmm(lhs, rhs_aiter, group_sizes, existing_out=out, config=cfg)
+
+
 def run_grouped_gemm_primus_triton(lhs, rhs, group_lens, out, M, K, N, G, grid_dim, num_xcds):
     """Primus-Turbo Triton persistent grouped GEMM, with grid_dim mapped to NUM_SMS.
 
@@ -458,10 +481,11 @@ def main():
     parser.add_argument("--num-ag", type=int, default=1,
                         help="Number of concurrent all-gathers to launch during overlap")
     parser.add_argument("--backend", type=str, default="triton",
-                        choices=["triton", "primus", "primus-triton"],
+                        choices=["triton", "primus", "primus-triton", "aiter-triton"],
                         help="Grouped GEMM backend: 'triton' (built-in), "
-                             "'primus' (Primus-Turbo CK), or 'primus-triton' "
-                             "(Primus-Turbo persistent Triton kernel)")
+                             "'primus' (Primus-Turbo CK), 'primus-triton' "
+                             "(Primus-Turbo persistent Triton kernel), or "
+                             "'aiter-triton' (aiter.ops.triton.gmm)")
     parser.add_argument("--trans-b", action="store_true",
                         help="Use transposed weight layout [G, N, K] "
                              "(primus / primus-triton backends only)")
@@ -510,6 +534,8 @@ def main():
         run_grouped_gemm = run_grouped_gemm_triton
     elif backend == "primus":
         run_grouped_gemm = run_grouped_gemm_primus
+    elif backend == "aiter-triton":
+        run_grouped_gemm = run_grouped_gemm_aiter_triton
     else:
         # primus-triton: kernel uses BLOCK_SIZE_K=64
         assert K % 64 == 0, f"K={K} must be divisible by 64"
@@ -538,7 +564,7 @@ def main():
     gs_list = [group_size_val] * G
     if remainder > 0:
         gs_list[-1] += remainder
-    gs_dtype = torch.int32 if backend == "triton" else torch.int64
+    gs_dtype = torch.int32 if backend in ("triton", "aiter-triton") else torch.int64
     group_sizes = torch.tensor(gs_list, dtype=gs_dtype, device=device)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=device)
 
