@@ -166,7 +166,13 @@ def run_grouped_gemm_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, nu
 
 def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_xcds):
     from primus_turbo.pytorch.ops import grouped_gemm as pt_grouped_gemm
-    return pt_grouped_gemm(lhs, rhs, group_lens, trans_b=_primus_trans_b, num_cu=num_cu)
+    return pt_grouped_gemm(
+        lhs, rhs, group_lens,
+        trans_b=_primus_trans_b,
+        num_cu=num_cu,
+        work_steal=_primus_use_ws_ck,
+        ws_counter=_primus_ws_ck_counter if _primus_use_ws_ck else None,
+    )
 
 
 def run_grouped_gemm_aiter_triton(lhs, rhs, group_sizes, out, M, K, N, G, grid_dim, _num_xcds):
@@ -258,12 +264,14 @@ def run_grouped_gemm_primus_triton(lhs, rhs, group_lens, out, M, K, N, G, grid_d
 # Default — overridden by main() based on --backend
 run_grouped_gemm = run_grouped_gemm_triton
 _primus_group_offs = None    # set in main() for the primus-triton backend
-_primus_use_ws = False       # set in main() when --ws is passed
+_primus_use_ws = False       # set in main() when --ws is passed (primus-triton)
 _primus_use_autotune = False # set in main() when --autotune is passed
 _primus_ws_counter = None    # allocated when --ws or --autotune is passed
 _primus_ws_mode = "auto"     # set in main() from --ws-mode
 _primus_total_tiles = None   # cached host-side total_tiles
 _primus_trans_b = False
+_primus_use_ws_ck = False    # set in main() when --ws-ck is passed (primus CK)
+_primus_ws_ck_counter = None # int32[1] counter buffer allocated when --ws-ck
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +517,11 @@ def main():
                              "@triton.autotune over a small config sweep. "
                              "First call per (G,N,K) takes ~10–30s; subsequent "
                              "calls hit the cache. (--backend primus-triton only)")
+    parser.add_argument("--ws-ck", action="store_true",
+                        help="Enable work stealing in the primus-turbo CK "
+                             "grouped GEMM (--backend primus only). Requires "
+                             "the modified primus-turbo build with the "
+                             "ck_grouped_gemm work_steal/ws_counter args.")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -518,15 +531,19 @@ def main():
     grid_dims = [int(x.strip()) for x in args.grid_dims.split(",")]
     backend = args.backend
 
-    global run_grouped_gemm, _primus_trans_b, _primus_use_ws, _primus_use_autotune, _primus_ws_mode
+    global run_grouped_gemm, _primus_trans_b, _primus_use_ws, _primus_use_autotune, \
+        _primus_ws_mode, _primus_use_ws_ck
     _primus_trans_b = args.trans_b
     _primus_use_ws = bool(args.ws)
     _primus_use_autotune = bool(args.autotune)
     _primus_ws_mode = args.ws_mode
+    _primus_use_ws_ck = bool(args.ws_ck)
     if args.ws and backend != "primus-triton":
         raise SystemExit("--ws is only supported with --backend primus-triton")
     if args.autotune and backend != "primus-triton":
         raise SystemExit("--autotune is only supported with --backend primus-triton")
+    if args.ws_ck and backend != "primus":
+        raise SystemExit("--ws-ck is only supported with --backend primus")
     if backend == "triton":
         # Ensure K is divisible by BLOCK_K=64
         assert K % 64 == 0, f"K={K} must be divisible by 64"
@@ -606,6 +623,14 @@ def main():
                               f"local_per_xcd={lpx} (phase1={lpx * args.num_xcds}, "
                               f"phase2={phase2} of {_primus_total_tiles})",
                               file=sys.stderr)
+
+    # primus CK work-stealing counter (single int32, allocated once).
+    if backend == "primus" and args.ws_ck:
+        global _primus_ws_ck_counter
+        _primus_ws_ck_counter = torch.zeros(1, dtype=torch.int32, device=device)
+        if rank == 0:
+            print("Primus CK kernel: work-stealing ENABLED (--ws-ck)",
+                  file=sys.stderr)
 
     ag_numel = args.ag_size_mb * 1024 * 1024 // 2  # bf16 = 2 bytes
     num_ag = args.num_ag
