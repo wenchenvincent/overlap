@@ -172,6 +172,7 @@ def run_grouped_gemm_primus(lhs, rhs, group_lens, out, M, K, N, G, num_cu, _num_
         num_cu=num_cu,
         work_steal=_primus_use_ws_ck,
         ws_counter=_primus_ws_ck_counter if _primus_use_ws_ck else None,
+        ws_local_per_xcd=_primus_ws_ck_local_per_xcd,
     )
 
 
@@ -271,7 +272,8 @@ _primus_ws_mode = "auto"     # set in main() from --ws-mode
 _primus_total_tiles = None   # cached host-side total_tiles
 _primus_trans_b = False
 _primus_use_ws_ck = False    # set in main() when --ws-ck is passed (primus CK)
-_primus_ws_ck_counter = None # int32[1] counter buffer allocated when --ws-ck
+_primus_ws_ck_counter = None # int32[NUM_XCDS+1] counter buffer
+_primus_ws_ck_local_per_xcd = 0  # WS mode selector — 0 = global, big = per-xcd, mid = hierarchical
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +524,17 @@ def main():
                              "grouped GEMM (--backend primus only). Requires "
                              "the modified primus-turbo build with the "
                              "ck_grouped_gemm work_steal/ws_counter args.")
+    parser.add_argument("--ws-ck-mode",
+                        choices=["global", "per-xcd", "hierarchical"],
+                        default="global",
+                        help="CK WS mode (--ws-ck only). 'global' uses a "
+                             "single atomic counter shared across all CTAs. "
+                             "'per-xcd' gives each XCD its own counter "
+                             "(no cross-XCD stealing). 'hierarchical' "
+                             "drains each XCD's local counter for ~50% of "
+                             "tiles, then falls back to a global counter "
+                             "for the rest (cross-XCD stealing for the "
+                             "tail).")
     args = parser.parse_args()
 
     local_rank, world_size, rank = setup_distributed()
@@ -624,12 +637,33 @@ def main():
                               f"phase2={phase2} of {_primus_total_tiles})",
                               file=sys.stderr)
 
-    # primus CK work-stealing counter (single int32, allocated once).
+    # primus CK work-stealing counter (per-XCD slots + 1 global slot).
     if backend == "primus" and args.ws_ck:
-        global _primus_ws_ck_counter
-        _primus_ws_ck_counter = torch.zeros(1, dtype=torch.int32, device=device)
+        global _primus_ws_ck_counter, _primus_ws_ck_local_per_xcd
+        NUM_XCDS_WS = 8  # must match NUM_XCDS_WS in grouped_gemm_kernel_ws.hpp
+        _primus_ws_ck_counter = torch.zeros(
+            NUM_XCDS_WS + 1, dtype=torch.int32, device=device)
+
+        # Compute total_tiles host-side using the CK runner's tile shape
+        # (M_TILE = N_TILE = 256 for the BF16/FP16 path).
+        M_TILE = 256
+        N_TILE = 256
+        num_n_tiles = (N + N_TILE - 1) // N_TILE
+        total_tiles = sum((m_g + M_TILE - 1) // M_TILE for m_g in gs_list) * num_n_tiles
+
+        if args.ws_ck_mode == "global":
+            _primus_ws_ck_local_per_xcd = 0
+        elif args.ws_ck_mode == "per-xcd":
+            _primus_ws_ck_local_per_xcd = (total_tiles + NUM_XCDS_WS - 1) // NUM_XCDS_WS
+        else:  # hierarchical: ~50% per-xcd, ~50% global tail
+            _primus_ws_ck_local_per_xcd = max(1, (total_tiles // 2) // NUM_XCDS_WS)
+
         if rank == 0:
-            print("Primus CK kernel: work-stealing ENABLED (--ws-ck)",
+            phase1_total = _primus_ws_ck_local_per_xcd * NUM_XCDS_WS
+            phase2 = max(0, total_tiles - phase1_total)
+            print(f"Primus CK WS: ENABLED, mode={args.ws_ck_mode}, "
+                  f"local_per_xcd={_primus_ws_ck_local_per_xcd}, "
+                  f"total_tiles={total_tiles}, phase1={phase1_total}, phase2={phase2}",
                   file=sys.stderr)
 
     ag_numel = args.ag_size_mb * 1024 * 1024 // 2  # bf16 = 2 bytes
